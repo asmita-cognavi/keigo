@@ -1,0 +1,353 @@
+import requests,json,os,ast,boto3,urllib
+from dotenv import load_dotenv
+import spacy
+nlp = spacy.load("ja_core_news_sm")
+import MeCab
+mecab = MeCab.Tagger("-Owakati")
+import asyncio
+import aiohttp
+from kango import japanese_stop_words
+from pydub import AudioSegment, silence
+#AudioSegment.converter = r"/usr/bin/ffmpeg"
+#load_dotenv()
+AudioSegment.converter = "/usr/bin/ffmpeg"
+AudioSegment.ffprobe = "/usr/bin/ffprobe"
+import tempfile
+
+tempfile.tempdir = '/tmp'
+os.environ['TMPDIR'] = '/tmp'
+session = boto3.Session(
+            aws_access_key_id="",
+            aws_secret_access_key=""
+        )
+s3 = session.resource('s3')
+content_object_oai = s3.Object('open-ai-key', 'open_ai_key.json')
+file_content_oai = content_object_oai.get()['Body'].read().decode('utf-8')
+sk = json.loads(file_content_oai)
+os.environ["OPENAI_API_KEY"] = sk['secret_key_1']
+api_key = os.environ["OPENAI_API_KEY"]
+def video_downloader_with_url(url, destination):
+    try:
+        urllib.request.urlretrieve(url, destination)
+    except Exception as e:
+        print(f"Error downloading file from URL: {e}") 
+async def extract_keigo(answer):
+    prompt = f"""Extract Keigo phrases from the following interview response: {answer}.
+    Identify the presence of phrases that indicate Humbleness, Respect, and Politeness, where each label is defined as follows:
+    
+    Humble: Here, the speaker lowers themselves or their in-group (such as their family or company) instead of elevating the listener. This form is characterized by humble verbs like "itasu" (to do) instead of "suru," and the use of self-deprecating terms when referring to one's actions or belongings. It is crucial in situations where one must show modesty or deference, especially in a professional context.
+   
+    Respect: This involves elevating the status of the person you are speaking to or about, often through special verbs and honorific prefixes. For example, the verb "suru" (to do) becomes "nasaru," and "kureru" (to give) transforms into "kudasaru." This form is frequently employed in professional settings and when addressing clients, superiors, or anyone of higher status.
+   
+    Polite: This is the standard polite language used in everyday situations. This form involves the use of the -masu and -desu endings on verbs and adjectives.It maintains a level of politeness and is appropriate in most social interactions.
+
+    Only extract phrases that fully match the definitions provided for Humble, Respect, and Polite forms. Avoid extracting phrases that do not fit these categories.
+    
+    For each identified phrase, provide:
+    - The exact phrase as it appears in the input sentence
+    - The surface form of the word
+    - The English translation
+
+    Classify each identified phrase into the categories of Humble, Respect, and Polite, placing each in the corresponding list. Do not add phrases that do not meet the definitions, and only check for the usage of Keigo forms in the input sentence.
+
+    Provide the output strictly in JSON format with the structure shown below:
+    
+    humble   // contains a list of keigo_json objects
+    respect  // contains a list of keigo_json objects
+    polite   // contains a list of keigo_json objects
+
+    Each keigo_json object should have the following keys:
+    - phrase
+    - surface_form
+    - english_translation
+    
+    If no forms are present in any class, return an empty list for that class. Only include Keigo forms that are explicitly present in the input sentence.
+    
+    Example output:
+  
+      "humble": [],
+      "respect": [],
+      "polite": []
+  
+
+    Output only the JSON string, without any additional information or explanations.
+    Re-check whether the extracted phrases satisfy the label definitions completely.
+    """
+
+
+    headers = {
+        'Authorization': 'Bearer ' + api_key,
+        'Content-Type': 'application/json',
+    }
+
+    json_data = {"model": "gpt-4o",
+                 "temperature": 0.1,
+                 "messages": [
+                     {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
+                     {"role": "user", "content": prompt}
+                 ]}
+    async with aiohttp.ClientSession() as session:
+        async with session.post('https://api.openai.com/v1/chat/completions', headers=headers, json=json_data) as response:
+            if response.status == 200:
+                res = await response.json()
+                res = res['choices'][0]['message']['content']
+                clean_res = res.replace("```json", "").replace("```", "").strip()
+                sonkeigo = ast.literal_eval(clean_res)["humble"]
+                kenjougo = ast.literal_eval(clean_res)["respect"]
+                teineigo = ast.literal_eval(clean_res)["polite"]
+                unique_teineigo = {entry['surface_form'] for entry in teineigo} 
+                unique_sonkeigo = {entry['surface_form'] for entry in sonkeigo}
+                unique_kenjougo = {entry['surface_form'] for entry in kenjougo}
+                print(f"total son. {len(sonkeigo)} unique {len(unique_sonkeigo)}")
+                print(f"total ken {len(kenjougo)} unique {len(unique_kenjougo)}")
+                print(f"total tei {len(teineigo)} unique {len(unique_teineigo)}")
+                response_keigo = {
+                    "sonkeigo":len(unique_sonkeigo),
+                    "kenjougo":len(unique_kenjougo),
+                    "teineigo":len(unique_teineigo)
+                }
+                return response_keigo
+
+            else:
+                print(f"Failed with status code: {response.status_code}")
+                print(response.text)
+
+def coherence_estimate(text,scale):
+    doc = nlp(text)
+    sentences = [sent.text for sent in doc.sents]
+    words = []
+    for sentence in sentences:
+        sentence_words = mecab.parse(sentence).strip().split()  
+        words.append(sentence_words)
+    
+    # Count transitions between sentences based on common words excluding stopwords
+    transitions = 0
+    for i in range(len(words)-1):
+        if set(words[i]) & set(words[i+1]) - japanese_stop_words:
+            transitions += 1
+   # Coherence score based on the proportion of sentence transitions
+    try:
+        coherence_score = transitions / (len(sentences)) if sentences else 0
+    except Exception as e:
+        coherence_score=0
+  
+    total = min(coherence_score*scale,scale)
+
+    return total
+
+async def ask_gpt_1(answer):
+    prompt = f"""
+    Evaluate the following response from the candidate in the Japanese foundational interview: {answer}. 
+    Focus on identifying significant grammar errors, specifically in particle usage, sentence structure,Adjectives,Adverbs and verb conjugation. 
+    Provide the output strictly in JSON format with the following keys:
+    - no_of_issues: The total count of issues detected.
+    - english_translation: Translate the answer to english accurately capturing sentiment and facts exactly.
+    - suggestion: This should have the suggestion by citing  any one of the exact incorrect phrase in the answer and providing corresponding correct usage.Keep suggestion concise and short in one or two lines.Add short reason about the transition if you make.Make sure to start suggestion with this phrase Focus on reducing grammar errors.
+    The following json example is for your reference
+    "no_if_issues": 2,
+    "english_translation": "In my opinion, teamwork is extremely important when working with people from different cultures. First, I make an effort to understand the  other person's culture. Then, I listen to and respect everyone's opinions. I believe it is essential to communicate properly and to discuss issues when they arise.  I think that helping one another leads to good teamwork
+    "suggestion": Focus on reducing grammar errors. Here "みんなの意見を聞いて、尊重している" should be "みんなの意見を聞いて、尊重する."   
+     If no errors are found, set "no_of_issues" to 0 and "suggestion" to an empty string. Do not add extra keys.
+     Return only the JSON output, with no additional commentary.
+    """
+    headers = {
+        'Authorization': 'Bearer ' + api_key,
+        'Content-Type': 'application/json',
+    }
+
+    json_data = {"model": "gpt-4o",
+                 "temperature": 0.1,
+                 "messages": [
+                     {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
+                     {"role": "user", "content": prompt}
+                 ]}
+
+    response = requests.post('https://api.openai.com/v1/chat/completions', headers=headers, json=json_data)
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post('https://api.openai.com/v1/chat/completions', headers=headers, json=json_data) as response:
+            if response.status == 200:
+                res = await response.json()
+                res = res['choices'][0]['message']['content']
+                clean_res = res.replace("```json", "").replace("```", "").strip()
+                grammar_data = ast.literal_eval(clean_res)
+                no_of_issues = grammar_data["no_of_issues"]
+                suggestion = grammar_data["suggestion"]
+                english_translation = grammar_data["english_translation"]
+                return no_of_issues, suggestion, english_translation
+            else:
+                print(f"Failed with status code: {response.status}")
+                return None
+
+
+async def find_pauses_and_filler_words(answer_in_audio_format,answer,strong_areas,areas_of_improvement):
+    silent_intervals = silence.detect_silence(answer_in_audio_format, min_silence_len=500, silence_thresh=-40)
+    pause_durations = [(end - start) / 1000 for start, end in silent_intervals]
+    total_pauses = len(pause_durations) 
+    fluency_score = 100
+    title = "Fluency"
+    #https://github.com/jiaaro/pydub/blob/master/API.markdown
+    if total_pauses <= 1:
+        fluency_score = fluency_score - 20
+        result = "Try to introduce a few more pauses to allow your message to resonate."
+        json_obj = {
+            "title":title,
+            "result":result
+        }
+        areas_of_improvement.append(json_obj)
+    elif total_pauses >=5:
+        diff = total_pauses - 5
+        fluency_score = max(0,fluency_score-(diff*5)) 
+        result = "Work on creating a smoother, more natural flow in your conversation."
+        json_obj = {
+            "title":title,
+            "result":result
+        }
+        areas_of_improvement.append(json_obj)
+    else:
+        result = "Your fluency is impressive, with a well-balanced pace and pauses."
+        json_obj = {
+            "title":title,
+            "result":result
+        }
+        strong_areas.append(json_obj)
+
+    return fluency_score,strong_areas,areas_of_improvement
+   
+   
+async def fetch_data(answer,answer_in_audio_format,strong_areas,areas_of_improvement):
+    task_1 = asyncio.create_task(ask_gpt_1(answer))
+
+    task_2 = asyncio.create_task(extract_keigo(answer))
+
+    task_3 = asyncio.create_task(find_pauses_and_filler_words(answer_in_audio_format,answer,strong_areas,areas_of_improvement))
+
+    no_of_issues, suggestion, english_text = await task_1
+    keigo_responses = await task_2
+    fluency_score,upd_strong_areas,upd_areas_of_improvement = await task_3
+
+    return no_of_issues, suggestion, english_text, keigo_responses,fluency_score,upd_strong_areas,upd_areas_of_improvement
+
+
+def video_downloader_with_url(url, destination):
+    try:
+        urllib.request.urlretrieve(url, destination)
+    except Exception as e:
+        print(f"Error downloading file from URL: {e}") 
+
+def evaluate_speaking_skills(answer,ideal_number_of_keigo,strong_areas,areas_of_improvement,file_path):
+
+    temp = '/tmp/temp.mp3'
+    video_downloader_with_url(file_path,temp)
+    answer_in_audio_format = AudioSegment.from_file(temp)
+
+    results = asyncio.run(fetch_data(answer,answer_in_audio_format,strong_areas,areas_of_improvement))
+  
+
+    no_of_issues, suggestion, english_text, keigo_responses,fluency_score,upd_strong_areas,upd_areas_of_improvement = results
+    
+    if os.path.exists(temp):
+        os.remove(temp)
+        print(f"{temp} has been deleted.")
+    else:
+        print(f"{temp} does not exist.") 
+
+    if no_of_issues == 0:
+        result = "Your grammar is flawless, with a seamless structure that enhances clarity and ensures your message is conveyed effectively."
+        json_obj = {
+            "title": "Grammar",
+            "result":result
+        }
+        upd_strong_areas.append(json_obj)
+    else:
+        result = suggestion
+        json_obj = {
+            "title":"Grammar",
+            "result":result
+        }
+        upd_areas_of_improvement.append(json_obj)
+    
+    grammar_score = max(0, 100 - no_of_issues * 10)
+
+    #vocabulary check
+
+
+    avg_diff = 0
+    c = 0
+    lack_key = None
+    max_dif = 0
+    flag = True
+    for key,value in ideal_number_of_keigo.items():
+        if value > keigo_responses[key]:
+            avg_diff = avg_diff + 2*(value - keigo_responses[key]) 
+            flag = False
+            if (value - keigo_responses[key]) > max_dif:
+                max_dif = (value - keigo_responses[key])
+                lack_key = key
+            c = c + 1
+
+    if c != 0:
+        avg_diff = avg_diff / c 
+
+    vocabulary_score = max(0,100 - avg_diff) 
+    vocab_score = vocabulary_score
+    title = "Keigo"
+    if lack_key == None:
+        result= "You exhibit an impressive command of keigo, highlighting your linguistic expertise. This level of proficiency significantly enhances your communication skills."
+        json_obj = {
+            "title": title,
+            "result":result
+        }
+        upd_strong_areas.append(json_obj)
+    result = None
+    if lack_key == "sonkeigo":
+        result = "While your overall keigo usage is strong, refining your understanding and application of sonkeigo (respectful language) will further elevate your ability to convey respect and formality."
+
+    if lack_key == "kenjougo":
+        result = "You have a solid grasp of keigo, though there is room for improvement in kenjougo (humble language). Enhancing your kenjougo will help you communicate with greater humility and precision in formal contexts."
+
+    if lack_key == "teineigo":
+        result = "Although your keigo skills are commendable, focusing on polishing your use of teineigo (polite language) will improve your ability to maintain politeness in everyday interactions."
+        
+    if result:
+        json_obj = {
+            "title":title,
+            "result":result
+        }
+        upd_areas_of_improvement.append(json_obj)
+
+
+    #coherence 
+    coherence_score = coherence_estimate(answer,100)
+    if coherence_score >= 75:
+        result = "Your responses exhibit excellent logical flow, making them easy to follow and understand."
+        title  = "Clarity and Coherence"
+        json_obj = {
+            "title":title,
+            "result":result
+        }
+        upd_strong_areas.append(json_obj)
+    else:
+        result = "Consider refining your transitions for smoother and more logical connections between ideas."
+        title  = "Clarity and Coherence"
+        json_obj = {
+            "title":title,
+            "result":result
+        }
+        upd_areas_of_improvement.append(json_obj)
+
+
+    total_section_score = 0.3*grammar_score + 0.3*fluency_score + 0.3*vocabulary_score + 0.1*coherence_score
+
+    total_section_score = (total_section_score / 100)*20
+
+    speaking_skills_dict = {
+        "total_section_score":round(total_section_score,2),
+        "grammar_score":round(grammar_score,2),
+        "fluency_score":round(fluency_score,2),
+        "vocabulary_score":round(vocabulary_score,2),
+        "coherence_score":round(coherence_score,2)
+    }
+
+    return total_section_score,english_text,no_of_issues,vocab_score,suggestion,upd_strong_areas,upd_areas_of_improvement,flag,keigo_responses,speaking_skills_dict
+    
